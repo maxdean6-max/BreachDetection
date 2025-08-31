@@ -13,4 +13,7 @@ The workflow of the analysis is as follows:
 3. Training data preparation and extraction
 4. Model training and classification
 
+Image acquisition and processing is performed using the ImageProcessing script, although the study dates / parameters set up in the script are set based on manual research to collect
+ten images over a specific location.
+
 
