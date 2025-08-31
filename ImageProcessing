@@ -1,0 +1,376 @@
+// // ----------------------------------------------------------------------
+// // >>>>>>>>>>>>>>>>>>>>>>>>> SCRIPT DESCRIPTION <<<<<<<<<<<<<<<<<<<<<<<<<
+
+// This script is for use in Google Earth Engine. It collects images over the location of a breach and 
+// processes them for the land cover classification analysis. The processing includes cloud cover filtering, 
+// adding spectral indexes, cloud masking, and gap filling. The final result is an image 'stack', a single 
+// image representing a collection of images, which can be input into a random forest classifier.
+
+// The script is currently set up to display a breach that occurs at the Bossington Beach location.
+
+// // -----------------------------------------------------------------------
+// // >>>>>>>>>>>>>>>>>>>>>>> USER DEFINED PARAMETERS <<<<<<<<<<<<<<<<<<<<<<<
+// This section contains the parameters to be set by the user for each study site.
+// This includes the breach location (represented by a point geometry) to set the AOI
+// and the study dates that will be used to collect imagery.
+
+// Digitise the point then create the square AOI using the bounds of a 2km radius circle.
+// The code for creating a square buffer is taken from: https://gis.stackexchange.com/questions/345267/creating-square-of-exact-size-e-g-1-km%C2%B2-around-point-in-google-earth-engine
+var breachLocation = ee.Geometry.Point([-3.585103913010881, 51.22571677106892]);
+var aoi = breachLocation.buffer(ee.Number(4000000).sqrt().divide(2), 1).bounds()
+
+// Add the square AOI as a visible area and centre the map viewer on it
+Map.addLayer(aoi, {color: 'red'}, 'Area of Interest', false);
+Map.centerObject(aoi);
+
+// Set the study dates
+var startdate = ee.Date('2023-09-06');
+var enddate = ee.Date('2025-03-05');
+
+// // -----------------------------------------------------------------------
+// // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> FUNCTIONS <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+// This section contains most of the necessary functions to collect and process imagery for the 
+// analysis, including cloud masking, adding indexes / metrics, and compiling the time series 
+// images into a single image (referred to as a 'stack') for use in the Random Forest model.
+
+// This function takes an image as input, creates a cloud mask, and returns the masked image.
+var cloudMask = function(image) {
+  // select the SCL band from the input image
+  var scl = image.select('SCL');
+      
+  // select all SCL values that should be unobscured. Excluded values include the following:
+  // cloud shadow, cloud high probability, and cloud medium probability. 
+  var clear_sky_pixels = scl.eq(0).or(scl.eq(1)).or(scl.eq(2)).or(scl.eq(4))
+                          .or(scl.eq(5)).or(scl.eq(6)).or(scl.eq(7))
+                          .or(scl.eq(10)).or(scl.eq(11));
+
+  // mask the input image based on the unobscured pixels, removing all obscured pixels
+  // return the masked image
+  return image.updateMask(clear_sky_pixels)
+      .copyProperties(image, ["system:time_start"]);
+}
+
+// This function takes an image as input, calculates the percentage of cloud cloud masked pixels,
+// sets it as an image property and returns the image. Adapted from: https://gis.stackexchange.com/questions/363682/counting-number-of-unmasked-pixels-per-image-in-collection-using-google-earth-en
+function get_cloud_cover_aoi(image){ 
+  // count the number of unmasked pixels within the AOI using reducers. The B2 band
+  // is used as it has the highest resolution available (10m)
+  var unmasked_pixelscount = image.select('B2').reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e9
+  }).get('B2')
+  
+  // count the total number of pixels within the AOI by unmasking the image
+  var npix = image.select('B2').unmask().reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e9
+  }).get('B2')
+
+  // calculate the percentage of masked pixels by dividing the number of unmasked pixels
+  // by the total number of pixels and subtracting from 1
+  var cloud_cover_aoi = ee.Number(1)
+      .subtract(ee.Number(unmasked_pixelscount).divide(npix))
+      .multiply(100)
+
+  // set the masked pixel percentage as a property called cloud_cover_aoi in the image
+  // return the image with the new property
+  return image.set('cloud_cover_aoi', cloud_cover_aoi)
+}
+
+// This function takes an image as input and calculates NDWI and NDVI, adding them as new bands to
+// the image. NDWI is calculated from the normalized difference of the Green (B3) and NIR (B8) bands.
+// NDVI is calculated from the normalized difference of the NIR and Red (B4) bands
+var addNDWI_NDVI = function(image) {
+  // calculate ndvi and ndwi bands from the bands in the input image and rename them as appropriate
+  var ndwi = image.normalizedDifference(['B3', 'B8']).rename('ndwi');
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('ndvi');
+  
+  // add the new ndwi and ndvi bands back to the input image
+  return image.addBands(ndwi).addBands(ndvi);
+};
+
+// The following two functions take image collections as input and calculate statistical metrics 
+// on NDVI and NDWI at the pixel level, returning them as images with bands representing the metrics. 
+// For instance, ndvi_max will be an image containing the maximum NDVI value for every pixel from
+// the input image collection
+var ndviMetrics = function(image_collection) {
+  // calculate a maximum NDVI image using the Reducer.max function
+  var ndvi_max = ee.Image(image_collection.select('ndvi').reduce(ee.Reducer.max()));
+  
+  // calculate minimum NDVI
+  var ndvi_min = ee.Image(image_collection.select('ndvi').reduce(ee.Reducer.min()));
+  
+  // calculate NDVI amplitude
+  var ndvi_amp = ndvi_max.subtract(ndvi_min);
+  
+  // calculate NDVI standard deviation
+  var ndvi_std = ee.Image(image_collection.select('ndvi').reduce(ee.Reducer.stdDev()));
+
+  // compile the metrics into a single image, renaming the bands as appropriate
+  var ndvi_metrics = ee.Image.cat([ndvi_max, ndvi_min, ndvi_amp, ndvi_std])
+                      .select(['ndvi_max','ndvi_min','ndvi_max_1','ndvi_stdDev'],
+                              ['ndvi_max','ndvi_min','ndvi_amp','ndvi_std']);
+  return ndvi_metrics;
+}
+
+var ndwiMetrics = function(image_collection) {
+  var ndwi_max = ee.Image(image_collection.select('ndwi').reduce(ee.Reducer.max()));
+  var ndwi_min = ee.Image(image_collection.select('ndwi').reduce(ee.Reducer.min()));
+  var ndwi_amp = ndwi_max.subtract(ndwi_min);
+  var ndwi_std = ee.Image(image_collection.select('ndwi').reduce(ee.Reducer.stdDev()));
+
+  var ndwi_metrics = ee.Image.cat([ndwi_max, ndwi_min, ndwi_amp, ndwi_std])
+                      .select(['ndwi_max','ndwi_min','ndwi_max_1','ndwi_stdDev'],
+                              ['ndwi_max','ndwi_min','ndwi_amp','ndwi_std']);
+  return ndwi_metrics
+}
+
+// This function takes an image as input and adds a timestamp property which will be used to sort
+// images in an image collection for the interpolation process
+var addTimestamp = function(image) {
+  var timeImage = image.metadata('system:time_start').rename('timestamp')
+  var timeImageMasked = timeImage.updateMask(image.mask().select(0)).toFloat()
+  return image.addBands(timeImageMasked)
+}
+
+// This function takes an image as input and removes the timestamp property
+function removeTimestamp(image) {
+  return image.select(
+    image.bandNames().filter(
+      ee.Filter.stringEndsWith('item', 'stamp').not()));
+}
+
+// This function takes an image collection as input and converts it to an image 'stack', a singular
+// image which contains the bands from all of the images in the image collection. The purpose of 
+// this conversion is to process the image collection into a format for use in the random forest model.
+// Taken from: https://gis.stackexchange.com/questions/254722/how-to-stack-bands-in-google-earth-engine
+// **NOTE: there is a built-in tool in GEE to accomplish this task, however it does not
+// work for this purpose because it resulting band names will not be standardised
+var stackCollection = function(image_collection) {
+  // select the first image in the image collection
+  var first = ee.Image(image_collection.first()).select([]);
+  
+  // This function takes two images as input, adding all of the bands from one of the images to the other
+  var appendBands = function(image, previous) {
+    return ee.Image(previous).addBands(image);
+  };
+  
+  // Iterate through the input image collection and use the appendBands function to add all of the 
+  // bands from every image in the collection to the first image in the collection, returning this as
+  // a single image
+  return ee.Image(image_collection.iterate(appendBands, first));
+};
+
+// // -------------------------------------------------------------------------
+// // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> DATA COLLECTION <<<<<<<<<<<<<<<<<<<<<<<<<<
+// In this section, the relevant images are collected and processed -
+// the processing includes cloud filtering, cloud masking and adding metrics
+
+// Import the Sentinel-2 database from GEE and store it as an image collection
+var training_data = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  // filter the collection by location (via AOI), date, and cloud cover (via built-in S2 cloud property)
+  .filterBounds(aoi)
+  .filterDate(startdate, enddate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50))
+  // clip the filtered images to the AOI
+  .map(function(image){return image.clip(aoi)})
+  // sort the resulting image collection by date
+  .sort('system:time_start');
+
+// collect the raw filtered images into a new collection, extracting the spectral bands and adding
+// NDVI and NDWI bands. This unmasked collection will be used for display / comparison
+var unmasked = training_data.select('B.+').map(addNDWI_NDVI);
+
+// create a collection of masked images from the filtered image collection. The images are masked
+// using the cloudMask function. These images are additionally filtered by AOI cloud cover. 
+// The spectral bands are extracted and NDVI and NDWI bands are added.
+var data_cloudless = training_data.map(cloudMask)
+                      .select('B.+')
+                      .map(addNDWI_NDVI)
+                      .map(get_cloud_cover_aoi)
+                      .filterMetadata('cloud_cover_aoi', 'less_than', 10);
+
+// // -------------------------------------------------------------------------
+// // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> IMAGE GAP FILLING <<<<<<<<<<<<<<<<<<<<<<<<
+// In this section, the cloud masked images are gap filled using temporal interpolation.
+// The code in this section is adapted from: https://spatialthoughts.com/2021/11/08/temporal-interpolation-gee/
+
+// add a timestamp to the cloud masked images and store this in a new collection 
+var filtered = data_cloudless.map(addTimestamp);
+
+// set the number of days to 'search' through the image collection for images to interpolate from
+// since the interpolation function sets a limit of 2 images (previous and post), the number of days
+// can be quite long. The number of days is converted to milliseconds since the timestamp is in milliseconds
+var days = 365;
+var millis = ee.Number(days).multiply(1000*60*60*24);
+
+// create filters to search for images within the set number of days above
+var maxDiffFilter = ee.Filter.maxDifference({
+  difference: millis,
+  leftField: 'system:time_start',
+  rightField: 'system:time_start'
+})
+
+var lessEqFilter = ee.Filter.lessThanOrEquals({
+  leftField: 'system:time_start',
+  rightField: 'system:time_start'
+})
+
+var greaterEqFilter = ee.Filter.greaterThanOrEquals({
+  leftField: 'system:time_start',
+  rightField: 'system:time_start'
+})
+
+var filter1 = ee.Filter.and(maxDiffFilter, lessEqFilter)
+var filter2 = ee.Filter.and(maxDiffFilter, greaterEqFilter)
+ 
+// create a join to find all images that occur 'after' an image in an image collection
+var join1 = ee.Join.saveAll({
+  matchesKey: 'after',
+  ordering: 'system:time_start',
+  ascending: true
+})
+
+// apply the filters with the join to the image collection. As a result, a property is added to
+// every image in the image collection listing all of the subsequent images in the image collection 
+var join1Result = join1.apply({
+  primary: filtered,
+  secondary: filtered,
+  condition: filter1
+})
+
+// create a join to find all images that occur 'before' an image in an image collection
+var join2 = ee.Join.saveAll({
+  matchesKey: 'before',
+  ordering: 'system:time_start',
+  ascending: false
+})
+
+// apply the filters with the join to the image collection. As a result, a property is added to
+// every image in the image collection listing all of the previous images in the image collection 
+var join2Result = join2.apply({
+  primary: join1Result,
+  secondary: join1Result,
+  condition: filter2
+})
+
+// This function applies the gap filling by taking an image as input and interpolating the values 
+// from the closest four images around it in its image collection
+var interpolateImages = function(img) {
+  var image = ee.Image(img)
+  // extract the 4 images in the collection around the target image (2 before and 2 after)
+  // store them as lists
+  var beforeImages = ee.List(image.get('before')).slice(0,3)
+  var afterImages = ee.List(image.get('after')).slice(0,3)
+  
+  // convert the before/after images to collections and merge them
+  var bef_col = ee.ImageCollection.fromImages(beforeImages);
+  var aft_col = ee.ImageCollection.fromImages(afterImages);
+  var allImages = bef_col.merge(aft_col);
+  
+  // calculate the pixel-by-pixel mean from the before and after images
+  var mean = allImages.mean();
+  
+  // Replace the masked pixels in the target image with the mean pixel value
+  var result = image.unmask(mean);
+  return result.copyProperties(image, ['system:time_start']);
+}
+
+// apply the gap filling / interpolatoin function to the cloud masked collection 
+// (join2Result represents the cloud masked collection after the necessary filters / properties have been added)
+var interpolatedCol = ee.ImageCollection(join2Result.map(interpolateImages))
+
+// // -------------------------------------------------------------------------
+// // >>>>>>>>>>>>>>>>>>>>>>>>> FINAL IMAGE PROCESSING <<<<<<<<<<<<<<<<<<<<<<<<
+
+// calculate NDVI and NDWI metrics from the cloud masked data
+var veg_metrics = ndviMetrics(data_cloudless);
+var water_metrics = ndwiMetrics(data_cloudless);
+
+// merge the interpolated collection with the metric images
+var imgcol = interpolatedCol.merge(veg_metrics).merge(water_metrics);
+
+// remove the timestamp property from the merged image collection
+var final_col = imgcol.map(removeTimestamp);
+
+// process the image collection into the image stack format
+var layer_stack = stackCollection(final_col);
+
+// // ------------------------------------------------------------------------
+// // >>>>>>>>>>>>>>>>>>>>>>>>>> IMAGE VISUALISATION <<<<<<<<<<<<<<<<<<<<<<<<<
+
+// convert the various image collections to lists
+var unmasked_list = unmasked.toList(unmasked.size());
+var cloudless_list = data_cloudless.toList(data_cloudless.size());
+var interpolated_list = interpolatedCol.toList(interpolatedCol.size());
+
+// create limit thresholds for loops
+var ival = interpolated_list.length().getInfo();
+var uval = unmasked_list.length().getInfo();
+
+// create the visualisation parameters. This visualisation is 'False Color Composite' which 
+// shows vegetation in red and water as very dark, making the breaches easy to spot
+var fccVis = {
+  min: 0.0,
+  max: 5000,
+  bands: ['B8', 'B4', 'B3'],
+};
+
+// loop through the cloud masked and interpolated image lists
+for(var i = 0; i < ival; i++) {
+  // find images at the current index i
+  var int_img = ee.Image(interpolated_list.get(i));
+  var cl_mask = ee.Image(cloudless_list.get(i));
+  
+  // add the cloud masked and interpolated images to the map viewer using the false 
+  // color composite visualisation
+  Map.addLayer(cl_mask, fccVis, "CL Image " + i, false);
+  Map.addLayer(int_img, fccVis, "Int. Image " + i, false);
+  
+  // extract the image date
+  var imageId = ee.String(cl_mask.get('system:index'));
+  var date = imageId.slice(0,8);
+  // extract the cloud cover parameters, both within the AOI and over the entire S2 image
+  var mask_percent = ee.String(cl_mask.get('cloud_cover_aoi'));
+  var cloud_percent = ee.String(cl_mask.get('CLOUDY_PIXEL_PERCENTAGE'));
+  // print information related to the indexed image 
+  print("Interpolated / Masked Image " + i + ":", date, cloud_percent, mask_percent);
+}
+
+// loop through the unmasked image list
+for(var i = 0; i < uval; i++) {
+  // find the unmasked image for the current index
+  var unmasked_img = ee.Image(unmasked_list.get(i));
+  
+  // add the image to the map viewer using the False Color Composite visualisation
+  Map.addLayer(unmasked_img, fccVis, "Unmasked " + i, false);
+  
+  // extract the images date and cloud cover percentage (since these are unmasked, the property
+  // for cloud cover within the AOI is unavailable)
+  var imageId = ee.String(unmasked_img.get('system:index'));
+  var cloud_percent = ee.String(unmasked_img.get('CLOUDY_PIXEL_PERCENTAGE'));
+  var date = imageId.slice(0,8)
+  
+  // print information related to the indexed image
+  print("Unmasked Image " + i + ":", date, cloud_percent);
+}
+
+// // -------------------------------------------------------------------------
+// // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> IMAGE EXPORT <<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+// Define projection
+var crs = 'EPSG:4326 '; // WGS 84 EPSG:4326
+
+// Export image to a GEE asset, which can then be imported back into any script
+Export.image.toAsset({
+  image: layer_stack,
+  description: 'layer_stack_export',
+  region: aoi,
+  crs: crs,
+  scale: 10,
+  maxPixels: 1e13
+});
