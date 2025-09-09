@@ -14,4 +14,6 @@ Manual research was conducted to select appropriate images for each study site. 
 
 Training data preparation was also done manually by digitising point features based on eight land cover classes. Training data extraction, model training, and site classification was performed using the 'TrainingClassification' script in this repository. This script requires the training points and image stacks for each site, which can be downloaded here: https://drive.google.com/file/d/1_MvZXh1Q_JIB4iUjyyNyv5wbixArCA5N/view?usp=sharing (WARNING: Large file, ~230mb)
 
-The training poitns and image stacks can be uploaded to GEE as assets, and then imported for use with the 'TrainingClassification' script. 
+The training points and image stacks can be uploaded to GEE as assets, and then imported for use with the 'TrainingClassification' script. The script only provides the means to create individually trained models (models trained on one specific site). The composite model can be created by combining training data from multiple sites.
+
+Please reach out with any questions to ucfamd1@ucl.ac.uk or max.dean6@gmail.com
