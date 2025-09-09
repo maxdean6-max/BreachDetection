@@ -1,0 +1,148 @@
+// ----------------------------------------------------------------------
+// >>>>>>>>>>>>>>>>>>>>>>>>> SCRIPT DESCRIPTION <<<<<<<<<<<<<<<<<<<<<<<<<
+
+// This script uses training data and time series image stacks from ten study sites to create individual RF 
+// classifier models. These models can be used to classify the other sites and compare the results.
+
+// Prior to running the script, the training data points and image stacks should be imported IN
+// ALPHABETICAL ORDER and not renamed (i.e. they should be left as 'imageX' and 'tableX'). In the 
+// 'Individual Model Parameters' section, the user can designate which site is to be used for training the model.
+
+// -----------------------------------------------------------------------
+// >>>>>>>>>>>>>>>>>>>>>>>>>> DATA ORGANISATION <<<<<<<<<<<<<<<<<<<<<<<<<<
+// This section renames the imported data for use later in the script, but it is based on the data being
+// imported in alphabetical order.
+
+var ballantrae = image;
+var ballinoulartBay = image2;
+var benacre = image3;
+var bossington = image4;
+var chesil = image5;
+var easton = image6;
+var ennereillyBay = image7;
+var longStrand = image8;
+var parkduffBay = image9;
+var theCoombe = image10;
+
+var ballantrae_points = table;
+var ballinoulartBay_points = table2;
+var benacre_points = table3;
+var bossington_points = table4;
+var chesil_points = table5;
+var easton_points = table6;
+var ennereillyBay_points = table7;
+var longStrand_points = table8;
+var parkduffBay_points = table9;
+var theCoombe_points = table10;
+
+// -----------------------------------------------------------------------
+// >>>>>>>>>>>>>>>>>>>>> INDIVIDUAL MODEL PARAMETERS <<<<<<<<<<<<<<<<<<<<<
+// This section contains the parameters to be set by the user for each individual model.
+// This includes the location to be used for model training (both image and points), as well as the 
+// number of trees to use in the model training.
+
+// set the training image and points by changing the name to one of the sites listed in the section above
+var training_image = bossington;
+var training_points = bossington_points;
+
+// set the number of trees to be used in model training. The analysis in my dissertation was completed using
+// 200 trees.
+var numberOfTrees = 200;
+
+// -------------------------------------------------------------------------
+// >>>>>>>>>>>>>>>>>>>>>>> INDIVIDUAL MODEL TRAINING <<<<<<<<<<<<<<<<<<<<<<<
+// This section extracts training data from the designated image stack and uses it to train a RF classifier model.
+
+// create a variable that designates the name of the attribute containing the land cover classes in the training
+// data points. This will be input into the model training to organise the training data into classes.
+var property = 'class';
+
+// create a variable that designates the imagery band names from the training image for input into the model
+var training_bands = training_image.bandNames();
+
+// extract training data from the image stack by 'sampling'. The training points are overlayed on the image stack 
+// and the band values for the overlapping pixels are extracted and assigned to the point's land cover class. 
+// This creates a small database of training data to use in the model training.
+var training_data = training_image.select(training_bands).sampleRegions({
+  collection: training_points,
+  properties: [property],
+  scale: 10,
+  tileScale: 1,
+  geometries: true
+});
+
+// train a Random Forest classifier with the previously designated number of trees, with the training data,
+// land cover attribute name, and imagery band names as input
+var classifierModel = ee.Classifier.smileRandomForest(numberOfTrees).train({
+  features: training_data,
+  classProperty: property,
+  inputProperties: training_bands,
+}); 
+
+// ------------------------------------------------------------------------
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>> CLASSIFICATION <<<<<<<<<<<<<<<<<<<<<<<<<<<<
+// This section performs the individual model classification for all study sites.
+
+// organise the image stacks into an image collection
+var img_col = ee.ImageCollection([
+  ballantrae,
+  ballinoulartBay,
+  benacre,
+  bossington,
+  chesil,
+  easton,
+  ennereillyBay,
+  longStrand,
+  parkduffBay,
+  theCoombe,
+]);
+
+// convert the collection into a list for iteration
+var img_list = img_col.toList(img_col.size());
+
+// set the visualisation parameters for each land cover class
+var classVis = {
+  min: 0,
+  max: 7,
+  palette: ['navy', 'red', 'orange', 'blue', 'cyan', 'green', 'yellow',
+            'grey']
+};
+
+// set a final iteration value for the loop
+var ival = img_list.length().getInfo();
+
+// Define the projection to use for exporting images
+var crs = 'EPSG:4326 '; // WGS 84 EPSG:4326
+
+// iterate through the image stack list and classify each image stack using the individual model
+for(var i = 0; i < ival; i++) {
+  // acquire the image to be classified from the list at the loop's current index
+  var classifier_image = ee.Image(img_list.get(i));
+  // classify the image using the trained classifier
+  var classified = classifier_image.select(training_bands).classify(classifierModel).byte();
+  
+  // acquire the images location name to print (the slicing numbers will likely need to be changed)
+  var imageId = ee.String(classifier_image.get('system:id'));
+  var imageName = imageId.slice(50,58);
+
+  // add the classified image to the map and designating it with the index
+  Map.addLayer(classified, classVis, "Classified Image " + i, false);
+  // print the index along with the location's name
+  print(i + ": ", imageName);
+  
+  // // UNCOMMENT THIS SECTION IF THE IMAGES SHOULD BE EXPORTED
+  
+  // // extract the imagery bounds
+  // var imageBounds = ee.Geometry(classified.geometry().getInfo());
+  // var current_aoi = ee.FeatureCollection(imageBounds);
+  
+  // // Export image to a GEE asset
+  // Export.image.toAsset({
+  //   image: classified,
+  //   description: 'classified' + i,
+  //   region: current_aoi,
+  //   crs: crs,
+  //   scale: 10,
+  //   maxPixels: 1e13
+  // });
+}
